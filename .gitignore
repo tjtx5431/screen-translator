@@ -1,10 +1,15 @@
-# 调试用的临时截图与日志
+# 调试用的临时截图、日志、识别结果
 *.png
 *.log
+.*.txt
 
 # 本地测试脚本
 .*.ps1
 !ScreenTranslator.ps1
+
+# 本地配置与缓存：里面是 API 密钥和翻译过的屏幕内容，都不要提交
+translator.config.json
+translator.cache.json
 
 # 系统垃圾
 Thumbs.db

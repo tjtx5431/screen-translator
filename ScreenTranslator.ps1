@@ -19,6 +19,7 @@ param(
     [switch]$SelfTest,        # 自检：只验证 OCR 和翻译接口是否可用，然后退出
     [switch]$Demo,            # 演示：直接弹一张样例卡片并截图，用于核对排版
     [switch]$OcrShot,         # 调试：只截指定区域跑一次 OCR，结果写进 .ocr.txt
+    [switch]$OcrBench,        # 基准：离线渲染小号英文，对比新旧两套 OCR 前处理的识别结果
     [int]$RectX = 0, [int]$RectY = 0, [int]$RectW = 800, [int]$RectH = 300
 )
 
@@ -33,12 +34,31 @@ $HotkeyName   = 'Ctrl+Alt+Z'
 $BaseCardW        = 460      # 结果卡片宽度
 $BaseCardMaxBody  = 360      # 卡片正文最大高度，超出则内部滚动
 $BaseMinSelectPx  = 8        # 小于这个尺寸的选框视为误触，直接忽略
-$TranslateTimeout = 6        # 翻译接口超时（秒）。正常翻译 0.1~0.8 秒；给 15 秒的话
+$TranslateTimeout = 6        # 免费翻译接口超时（秒）。正常翻译 0.1~0.8 秒；给 15 秒的话
                              # 断网时要依次干等三个接口超时，用户盯着「翻译中…」等一分多钟
-$ChunkSize        = 450      # 单次请求的最大字符数。
+$ApiTimeout       = 20       # DeepSeek 接口超时（秒）。大模型的首字延迟比免费接口大得多，
+                             # 沿用 6 秒会频繁误判成失败
+
+# ── OCR 前处理 ──
+# WinRT 的 OCR 模型是按「大概 30px 高的正文」训练的。屏幕上的英文（网页正文 12~16px，
+# 本机 150% 缩放后也就 18~24 物理像素）对它来说太小，实测会整段丢字——同一张图，
+# 一行字只认出右半边、左半边凭空消失。所以要把它放大到模型的舒适区。
+$OcrTargetMinDim = 64        # 放大后的短边至少要有这么多像素，不够就按这个比例放大。
+                             # 一个 60x22 的单词框会被放到 2.9 倍，而 800x300 的正文
+                             # 区域短边本来就够，仍走原来的 2 倍，行为不变
+$OcrMaxScale     = 6.0       # 放大倍数上限，免得 10x10 的误框被拉到离谱的尺寸
+                             # 注：曾经还想加「补留白」和「深色反色」两道前处理，
+                             # 用 -OcrBench 逐项量过，两项都是负收益，已删除。
+                             # 别凭直觉再加回来，先跑 -OcrBench
+
+# ── 翻译分块 ──
+$FreeChunkSize = 450         # 免费接口单次请求的最大字符数。
                              # 这个值是被备用接口 MyMemory 的 500 字符硬上限卡出来的；
                              # 有道实测 2000 字符会报错、6400 字符直接 URI 过长，
                              # 取 450 三个接口都能吃下，也不容易触发限流。
+$ApiChunkSize  = 3000        # DeepSeek 单次请求的最大字符数。放宽是为了「一次请求翻完
+                             # 整段」：请求数少，重复发送的 system prompt 就少；而且固定
+                             # 前缀命中上下文缓存后，输入按约 1/10 计价
 # ═════════════════════════════════════════════════════════════
 
 # ══ 1. DPI 感知（必须在加载 WinForms / 创建任何窗口之前） ═════
@@ -73,7 +93,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # 不加载这个程序集，下面就找不到 System.WindowsRuntimeSystemExtensions
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-if (-not $KeepConsole) {
+if (-not $KeepConsole -and -not $OcrBench) {   # 基准测试要往控制台打结果，别把它藏了
     try {
         $h = [StDpi]::GetConsoleWindow()
         if ($h -ne [IntPtr]::Zero) { [void][StDpi]::ShowWindow($h, 0) }   # SW_HIDE
@@ -202,24 +222,10 @@ function Convert-Bitmap($src, [double]$factor, [int]$dpi) {
     return $dst
 }
 
-# 识别。返回 @{ Result; Factor }。Factor 是喂给引擎前把图放大的倍数，
-# 后面拿到词框坐标要除回去。
-#
-# 为什么要放大：WinRT 的 OCR 模型是按「大概 30px 高的正文」训练的，屏幕上的
-# 英文（网页正文 12-16px，本机 150% 缩放后也就 18-24 物理像素）对它来说太小，
-# 实测会整段丢字——同一张图，一行字只认出右半边、左半边凭空消失。放大 2 倍
-# 之后这一行就完整认出来了。太大的区域（>100 万像素）不放大，避免一张全屏图
-# 变成 400 万像素拖慢识别。
-function Invoke-Ocr($bmp) {
-    $factor = 1.0
-    $src = $bmp
-    if (($bmp.Width * $bmp.Height) -le 1000000) {
-        $factor = 2.0
-        $src = Convert-Bitmap $bmp 2.0 96
-    }
-
+# 把位图喂给 WinRT OCR。全程内存，不落盘
+function Invoke-OcrRaw($bmp) {
     $ms = New-Object System.IO.MemoryStream
-    $src.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)      # 全程内存，不落盘
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($ms)
     $ras.Seek(0) | Out-Null
 
@@ -229,8 +235,36 @@ function Invoke-Ocr($bmp) {
 
     $eng = Get-OcrEngine
     if (-not $eng) { throw '系统没有可用的 OCR 语言包（需要 en-US）' }
-    $res = Await ($eng.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult])
-    if ($factor -ne 1.0) { $src.Dispose() }
+    return Await ($eng.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult])
+}
+
+# 识别。返回 @{ Result; Factor; Pad; Invert }。
+# Factor 是喂给引擎前把图放大的倍数、Pad 是留白宽度，拿到词框坐标要按这两个值反算。
+#
+# 放大倍数按「区域短边凑够 $OcrTargetMinDim」算，而不是写死 2 倍：模型是按 30px 字高
+# 训练的，一个单词的小框放大 2 倍往往还是太小，得放到 3~6 倍才认得出来。而正常正文
+# 区域的短边本来就超过 64，仍然落回原来的 2 倍；大区域（>100 万像素）照旧不放大。
+# 也就是说只有「小区域」这一种情况的行为变了。
+function Get-OcrScale($bmp, [double]$target = $OcrTargetMinDim) {
+    $minDim = [Math]::Min($bmp.Width, $bmp.Height)
+    if ($minDim -lt 1) { $minDim = 1 }
+    $factor = [Math]::Min($OcrMaxScale, $target / [double]$minDim)
+    # 大图本来就不缺像素，别为了凑数把它放大到卡住；小图才按上面的比例放大
+    if ($factor -lt 2.0 -and ($bmp.Width * $bmp.Height) -le 1000000) { $factor = 2.0 }
+    $factor = [Math]::Max(1.0, $factor)
+    # 兜底：放大后超过 400 万像素就逐档降回来，免得一张大图把识别拖慢
+    while (($bmp.Width * $factor) * ($bmp.Height * $factor) -gt 4000000 -and $factor -gt 1.5) {
+        $factor -= 0.5
+    }
+    return $factor
+}
+
+function Invoke-Ocr($bmp) {
+    $factor = Get-OcrScale $bmp
+    $src = Convert-Bitmap $bmp $factor 96
+    try { $res = Invoke-OcrRaw $src }
+    finally { $src.Dispose() }
+
     return [pscustomobject]@{ Result = $res; Factor = $factor }
 }
 
@@ -359,29 +393,199 @@ function Invoke-MyMemoryTranslate($text) {
     return $t
 }
 
-# 三个免费接口按可靠性排序，前一个失败就自动退到下一个。
-# 全部是公开的非官方接口，随时可能失效——所以留了三个，并且失败会明确告诉用户。
-$script:Engines = @(
-    @{ Name = '有道'; Fn = { param($c) Invoke-YoudaoTranslate $c } },
-    @{ Name = 'Google'; Fn = { param($c) Invoke-GoogleTranslate $c } },
-    @{ Name = 'MyMemory'; Fn = { param($c) Invoke-MyMemoryTranslate $c } }
-)
+# ── 配置文件（脚本同目录，不进 git） ──
+# 读取路径用 $PSScriptRoot，不受 .lnk 的工作目录影响。
+# 缺文件 / 字段缺失 / JSON 坏掉一律静默降级成「没有配置」，绝不因此让工具起不来。
+$script:ConfigPath = Join-Path $PSScriptRoot 'translator.config.json'
 
-$script:Cache = @{}      # 相同内容不重复请求，长按热键时很省事
+function Get-AppConfig {
+    $cfg = [ordered]@{
+        apiKey  = ''
+        baseUrl = 'https://api.deepseek.com'
+        model   = 'deepseek-chat'
+        useApi  = $false
+    }
+    try {
+        if (Test-Path -LiteralPath $script:ConfigPath) {
+            $raw = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $j = $raw | ConvertFrom-Json
+                foreach ($k in @($cfg.Keys)) {
+                    $v = $j.$k
+                    if ($null -ne $v -and "$v" -ne '') { $cfg[$k] = $v }
+                }
+                $cfg.useApi = [bool]$cfg.useApi
+            }
+        }
+    }
+    catch { }        # 配置坏了 = 没配置
+    return [pscustomobject]$cfg
+}
 
-function Invoke-Translate($text) {
-    if ($script:Cache.ContainsKey($text)) {
-        return [pscustomobject]@{ Text = $script:Cache[$text]; Engine = '缓存'; Failed = $false }
+function Save-AppConfig($cfg) {
+    try {
+        $json = [pscustomobject]@{
+            apiKey  = [string]$cfg.apiKey
+            baseUrl = [string]$cfg.baseUrl
+            model   = [string]$cfg.model
+            useApi  = [bool]$cfg.useApi
+        } | ConvertTo-Json
+        [System.IO.File]::WriteAllText($script:ConfigPath, $json,
+            (New-Object System.Text.UTF8Encoding $false))
+    }
+    catch { }        # 存不下就算了，不能因此把工具搞崩
+}
+
+# ── DeepSeek（可选的高质量模式） ──
+# 这段 prompt 必须【逐字节不变】：DeepSeek 的上下文缓存按前缀命中，前缀一变缓存全失效，
+# 命中价约为未命中的 1/10。别在这里拼接变量、别顺手改字。
+$ApiSystemPrompt = '英译中。只输出译文，不要解释、拼音或原文，保持原文换行。'
+
+function Invoke-DeepSeekTranslate($text) {
+    if (-not $script:Cfg.apiKey) { throw '没配 DeepSeek 密钥' }
+
+    $body = [pscustomobject]@{
+        model       = $script:Cfg.model
+        temperature = 0
+        # 按字符数估算上限，防止响应跑飞；给得宽松以免译文被截断
+        max_tokens  = [Math]::Min(8192, [Math]::Max(256, $text.Length * 2))
+        messages    = @(
+            [pscustomobject]@{ role = 'system'; content = $ApiSystemPrompt }
+            [pscustomobject]@{ role = 'user'; content = $text }
+        )
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    # 收发两端都得自己管编码，别换回 Invoke-RestMethod：
+    #   发——PS 5.1 传字符串 body 会按 ISO-8859-1 编码，中文直接乱码，必须先转成 UTF-8 字节；
+    #   收——DeepSeek 的响应头是 `application/json`、**不带 charset**，PS 5.1 遇到没写 charset
+    #       的响应会退回 ISO-8859-1 解码，译文会变成「æä½æåå®æã」这种鬼东西（实测过）。
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    $req = [System.Net.HttpWebRequest]::Create($script:Cfg.baseUrl.TrimEnd('/') + '/chat/completions')
+    $req.Method = 'POST'
+    $req.ContentType = 'application/json; charset=utf-8'
+    $req.Headers.Add('Authorization', 'Bearer ' + $script:Cfg.apiKey)
+    $req.Timeout = $ApiTimeout * 1000
+    $req.ReadWriteTimeout = $ApiTimeout * 1000
+    $req.ContentLength = $bytes.Length
+
+    try {
+        $rs = $req.GetRequestStream()
+        $rs.Write($bytes, 0, $bytes.Length)
+        $rs.Close()
+        $resp = $req.GetResponse()
+    }
+    catch [System.Net.WebException] {
+        # 出错时响应体里是服务端的说明（余额不足、key 不对……），也按 UTF-8 读出来，
+        # 光报一个「400 错误的请求」对排查毫无帮助
+        $er = $_.Exception.Response
+        $detail = ''
+        if ($er) {
+            $sr = New-Object System.IO.StreamReader($er.GetResponseStream(), [System.Text.Encoding]::UTF8)
+            $detail = $sr.ReadToEnd().Trim()
+            $sr.Dispose(); $er.Dispose()
+        }
+        throw ('DeepSeek 请求失败：' + $_.Exception.Message + $(if ($detail) { '｜' + $detail } else { '' }))
     }
 
-    $chunks = Split-Chunks $text $ChunkSize
+    try {
+        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        $json = $sr.ReadToEnd()
+        $sr.Dispose()
+    }
+    finally { $resp.Dispose() }
+
+    try { $r = $json | ConvertFrom-Json }
+    catch { throw ('DeepSeek 返回了看不懂的内容：' + $json) }
+
+    $t = [string]$r.choices[0].message.content
+    if ([string]::IsNullOrWhiteSpace($t)) { throw 'DeepSeek 返回了空结果' }
+    return $t.Trim()
+}
+
+# 三个免费接口按可靠性排序，前一个失败就自动退到下一个。
+# 全部是公开的非官方接口，随时可能失效——所以留了三个，并且失败会明确告诉用户。
+function New-FreeEngines {
+    return @(
+        @{ Name = '有道'; Fn = { param($c) Invoke-YoudaoTranslate $c } },
+        @{ Name = 'Google'; Fn = { param($c) Invoke-GoogleTranslate $c } },
+        @{ Name = 'MyMemory'; Fn = { param($c) Invoke-MyMemoryTranslate $c } }
+    )
+}
+
+# 高质量模式下 DeepSeek 打头；它挂了会继续往下退到免费接口，
+# 不会因为 API 抽风就整个翻不出字
+function Get-EngineList {
+    if ($script:Cfg.useApi -and $script:Cfg.apiKey) {
+        return @(@{ Name = 'DeepSeek'; Fn = { param($c) Invoke-DeepSeekTranslate $c } }) + (New-FreeEngines)
+    }
+    return New-FreeEngines
+}
+
+function Get-ModeTag { if ($script:Cfg.useApi -and $script:Cfg.apiKey) { 'api' } else { 'free' } }
+
+# ── 译文缓存（落盘，跨会话有效） ──
+$script:CachePath = Join-Path $PSScriptRoot 'translator.cache.json'
+$script:CacheMax = 800
+$script:Cache = @{}
+$script:CacheKeys = New-Object System.Collections.ArrayList
+
+function Load-TranslateCache {
+    try {
+        if (Test-Path -LiteralPath $script:CachePath) {
+            $raw = Get-Content -LiteralPath $script:CachePath -Raw -Encoding UTF8
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                foreach ($p in ($raw | ConvertFrom-Json).PSObject.Properties) {
+                    $script:Cache[$p.Name] = [string]$p.Value
+                    [void]$script:CacheKeys.Add($p.Name)
+                }
+            }
+        }
+    }
+    catch { $script:Cache = @{} }   # 缓存坏了就当没有，绝不影响翻译
+}
+
+function Save-TranslateCache {
+    try {
+        $o = [ordered]@{}
+        foreach ($k in $script:CacheKeys) { if ($script:Cache.ContainsKey($k)) { $o[$k] = $script:Cache[$k] } }
+        [System.IO.File]::WriteAllText($script:CachePath, ($o | ConvertTo-Json -Depth 3),
+            (New-Object System.Text.UTF8Encoding $false))
+    }
+    catch { }        # 磁盘出错绝不能影响翻译本身
+}
+
+# 缓存键必须带上模式：否则用户从免费模式切到高质量模式时，
+# 会拿回免费接口的旧译文，那个开关就白点了
+function Set-Cached($key, $val) {
+    if (-not $script:Cache.ContainsKey($key)) { [void]$script:CacheKeys.Add($key) }
+    $script:Cache[$key] = $val
+    while ($script:CacheKeys.Count -gt $script:CacheMax) {     # 超上限就丢最旧的
+        $old = $script:CacheKeys[0]
+        $script:CacheKeys.RemoveAt(0)
+        $script:Cache.Remove($old)
+    }
+    Save-TranslateCache
+}
+
+function Invoke-Translate($text) {
+    $key = (Get-ModeTag) + '|' + $text
+    if ($script:Cache.ContainsKey($key)) {
+        return [pscustomobject]@{ Text = $script:Cache[$key]; Engine = '缓存'; Failed = $false }
+    }
+
+    # 高质量模式下一次能送 $ApiChunkSize 字，一段正文通常一次请求就够
+    # ——这就是「批量合并请求」省 token 的落点；免费接口受 MyMemory 的 500 字硬上限约束，只能 450
+    $chunkSize = if ($key.StartsWith('api|')) { $ApiChunkSize } else { $FreeChunkSize }
+    $chunks = Split-Chunks $text $chunkSize
+    $engines = Get-EngineList
+    $primary = $engines[0].Name
     $out = New-Object System.Collections.ArrayList
     $usedEngine = $null
     $lastErr = $null
 
     foreach ($c in $chunks) {
         $piece = $null
-        foreach ($e in $script:Engines) {
+        foreach ($e in $engines) {
             try {
                 $piece = & $e.Fn $c
                 if (-not $usedEngine) { $usedEngine = $e.Name }
@@ -394,9 +598,15 @@ function Invoke-Translate($text) {
     }
 
     $result = (-join $out)
-    $script:Cache[$text] = $result
+    # 只在主引擎成功时缓存。DeepSeek 挂了退回免费接口时，存下来的其实是免费译文，
+    # 用户补上余额之后还会一直读到它——看起来就像「开了高质量模式没效果」。免费模式下
+    # 有道 失败退到 Google 同理。宁可少缓存一次，也别把次一等的译文长期留在盘上。
+    if ($usedEngine -eq $primary) { Set-Cached $key $result }
     return [pscustomobject]@{ Text = $result; Engine = $usedEngine; Failed = $false }
 }
+
+$script:Cfg = Get-AppConfig
+Load-TranslateCache
 
 # ══ 7. 结果卡片 ══════════════════════════════════════════════
 function New-CardButton($parent, $text, $x, $y, $w) {
@@ -721,6 +931,11 @@ if ($SelfTest) {
     $ls = Get-OcrLines $r 0 0
     "  耗时 $($sw.ElapsedMilliseconds)ms，识别到 $($ls.Count) 行"
     $bmp.Dispose()
+    "=== 配置 ==="
+    "  文件: " + $script:ConfigPath + "  存在=" + (Test-Path -LiteralPath $script:ConfigPath)
+    # 只报长度，不打印密钥本身——自检输出常被贴到别处
+    "  apiKey: " + $(if ($script:Cfg.apiKey) { "已配置（$($script:Cfg.apiKey.Length) 字符）" } else { '未配置' })
+    "  模型: " + $script:Cfg.model + "  模式: " + (Get-ModeTag) + "  缓存: $($script:Cache.Count) 条"
     "=== 翻译实测 ==="
     foreach ($sample in @('Hello world, this is a test.', 'The operation completed successfully.')) {
         $sw.Restart()
@@ -746,6 +961,76 @@ if ($OcrShot) {
         [void]$sb.AppendLine(("   [{0},{1} {2}x{3}] {4}" -f $l.X, $l.Y, $l.W, $l.H, $l.Text))
     }
     [System.IO.File]::WriteAllText("$PSScriptRoot\.ocr.txt", $sb.ToString(),
+        (New-Object System.Text.UTF8Encoding $true))
+    exit 0
+}
+
+# ══ 10a2. OCR 基准（离线渲染，不需要人肉框选） ═══════════════
+# 把小号英文渲染成位图，分别跑「改前」和「改后」两条前处理路径，对比识别结果。
+# 这是判断留白 / 反色 / 自适应放大到底哪一项真的有用的唯一客观依据——
+# 量出来没收益的那项就该删掉，否则识别行为会变成说不清的玄学。
+if ($OcrBench) {
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($size in @(11, 14, 18)) {
+        foreach ($dark in @($false, $true)) {
+            foreach ($cut in @(0, 1)) {   # 0=选框紧贴字形；1=再往里切 1px，模拟手抖
+                # 字号必须按【像素】给。Font 默认单位是「点」，11 点其实是 ~15px，
+                # 那样压根测不到小字
+                $fnt = New-Object System.Drawing.Font -ArgumentList 'Consolas', $size, ([System.Drawing.GraphicsUnit]::Pixel)
+                $pad0 = 40
+                $probe = New-Object System.Drawing.Bitmap -ArgumentList 300, ($size * 3 + $pad0 * 2)
+                $g = [System.Drawing.Graphics]::FromImage($probe)
+                $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+                $bgc = if ($dark) { [System.Drawing.Color]::FromArgb(20, 20, 20) } else { [System.Drawing.Color]::White }
+                $fgc = if ($dark) { [System.Drawing.Color]::FromArgb(220, 220, 220) } else { [System.Drawing.Color]::Black }
+                $g.Clear($bgc)
+                $br = New-Object System.Drawing.SolidBrush $fgc
+                $sf = [System.Drawing.StringFormat]::GenericTypographic
+                $gsz = $g.MeasureString('proxy', $fnt, 1000, $sf)   # 量的是紧贴字形的尺寸
+                $g.DrawString('proxy', $fnt, $br, $pad0, $pad0, $sf)
+                $br.Dispose(); $sf.Dispose(); $g.Dispose(); $fnt.Dispose()
+
+                # 裁成【紧贴字形】的框。这才是「框一个词」时真正的输入——字形压在选框
+                # 边缘上、甚至被切掉一点。不这样裁的话边框本来就有一圈空白，留白无处可补，
+                # 根本测不出它有没有用
+                $rx = $pad0 + $cut
+                $ry = $pad0 + $cut
+                $rw = [int][Math]::Max(4, [Math]::Ceiling($gsz.Width) - 2 * $cut)
+                $rh = [int][Math]::Max(4, [Math]::Ceiling($gsz.Height) - 2 * $cut)
+                $rect = New-Object System.Drawing.Rectangle -ArgumentList $rx, $ry, $rw, $rh
+                $bmp = $probe.Clone($rect, $probe.PixelFormat)
+                $probe.Dispose()
+
+                # 改前：固定放大 2 倍
+                $src = Convert-Bitmap $bmp 2.0 96
+                $c1 = (@(Get-OcrLines ([pscustomobject]@{ Result = (Invoke-OcrRaw $src); Factor = 2.0 }) 0 0) |
+                    ForEach-Object { $_.Text }) -join ' | '
+                $src.Dispose()
+
+                # 改后：自适应放大——现在唯一保留的前处理。目标短边取几个值试，
+                # 看 64 是不是偏小（放大后字数越高，模型越吃得准）
+                $cols = New-Object System.Collections.ArrayList
+                foreach ($tgt in @(64, 96, 128)) {
+                    $factor = Get-OcrScale $bmp $tgt
+                    $src = Convert-Bitmap $bmp $factor 96
+                    $c = (@(Get-OcrLines ([pscustomobject]@{ Result = (Invoke-OcrRaw $src); Factor = $factor }) 0 0) |
+                        ForEach-Object { $_.Text }) -join ' | '
+                    $src.Dispose()
+                    # 外面这层括号不能省：方法实参按逗号切分，不加括号的话 -f 只吃到第一个操作数
+                    [void]$cols.Add(("目标{0,3}={1,4:0.0}x[{2,-8}]" -f $tgt, [double]$factor, $c))
+                }
+
+                $tone = if ($dark) { '深底' } else { '浅底' }
+                $crop = if ($cut -eq 0) { '紧贴' } else { '切边' }
+                [void]$rows.Add(("字号{0,2}px {1} {2} {3,3}x{4,-3}  改前[{5,-8}] {6}" -f
+                        $size, $tone, $crop, $rw, $rh, $c1, ($cols -join ' ')))
+                $bmp.Dispose()
+            }
+        }
+    }
+    $report = ($rows -join "`r`n")
+    $report
+    [System.IO.File]::WriteAllText("$PSScriptRoot\.ocrbench.log", $report,
         (New-Object System.Text.UTF8Encoding $true))
     exit 0
 }
@@ -797,11 +1082,29 @@ $hooked = $hk.Hook([uint32]$HotkeyMods, [uint32]$HotkeyKey)
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $miGo     = $menu.Items.Add('立即划词翻译')
+$miApi    = $menu.Items.Add('高质量翻译（DeepSeek）')
 $miHelp   = $menu.Items.Add('使用说明')
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $miExit   = $menu.Items.Add('退出')
 $miGo.Add_Click({ Start-Selection })
+
+# 没配密钥就置灰——点了也没用，不如干脆不让点，免得用户以为开了其实没生效
+$miApi.CheckOnClick = $true
+$miApi.Checked = [bool]($script:Cfg.useApi -and $script:Cfg.apiKey)
+if (-not $script:Cfg.apiKey) {
+    $miApi.Enabled = $false
+    $miApi.ToolTipText = "没找到密钥：请在脚本同目录的 translator.config.json 里填 apiKey"
+}
+else {
+    $miApi.ToolTipText = '用 DeepSeek 翻译，质量更好但要花 token；失败会自动退回免费接口'
+}
+$miApi.Add_Click({
+        $script:Cfg.useApi = [bool]$miApi.Checked
+        Save-AppConfig $script:Cfg        # 勾选状态回写配置，下次启动还记得
+    })
+
 $miHelp.Add_Click({
+        $apiState = if ($script:Cfg.apiKey) { '已配置，可从托盘菜单勾选' } else { '未配置（同目录 translator.config.json 里填 apiKey）' }
         [void][System.Windows.Forms.MessageBox]::Show(
             "用法：" + "`n" +
             "  1. 按 " + $HotkeyName + "（或右键托盘图标选「立即划词翻译」）" + "`n" +
@@ -810,8 +1113,10 @@ $miHelp.Add_Click({
             "  4. 按 Esc 或点卡片外面收起；框选途中按 Esc / 右键可取消" + "`n`n" +
             "说明：" + "`n" +
             "  · 识别用 Windows 自带 OCR，离线完成，不联网" + "`n" +
-            "  · 翻译会把识别到的文字发到免费的在线翻译接口" + "`n" +
-            "  · 卡片上的「复制译文」按钮可把译文放进剪贴板",
+            "  · 翻译会把识别到的文字发到第三方翻译服务（免费接口，或勾选高质量模式后的 DeepSeek）" + "`n" +
+            "  · 译文会缓存在同目录 translator.cache.json，重复翻译不再请求网络" + "`n" +
+            "  · 卡片上的「复制译文」按钮可把译文放进剪贴板" + "`n`n" +
+            "DeepSeek 高质量模式：" + $apiState,
             '屏幕翻译 - 使用说明',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information)
