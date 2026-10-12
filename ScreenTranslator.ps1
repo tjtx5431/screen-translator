@@ -36,8 +36,10 @@ $BaseCardMaxBody  = 360      # 卡片正文最大高度，超出则内部滚动
 $BaseMinSelectPx  = 8        # 小于这个尺寸的选框视为误触，直接忽略
 $TranslateTimeout = 6        # 免费翻译接口超时（秒）。正常翻译 0.1~0.8 秒；给 15 秒的话
                              # 断网时要依次干等三个接口超时，用户盯着「翻译中…」等一分多钟
-$ApiTimeout       = 20       # DeepSeek 接口超时（秒）。大模型的首字延迟比免费接口大得多，
-                             # 沿用 6 秒会频繁误判成失败
+$ApiTimeout       = 30       # DeepSeek 接口超时（秒）。大模型的首字延迟比免费接口大得多，
+                             # 沿用 6 秒会频繁误判成失败；实测同一句话冷启动要过 15.5 秒，
+                             # 给 20 秒太贴边——超时后会静默退回免费接口，看起来就像
+                             # 「开了高质量模式却没效果」，宁可多等也不误判
 
 # ── OCR 前处理 ──
 # WinRT 的 OCR 模型是按「大概 30px 高的正文」训练的。屏幕上的英文（网页正文 12~16px，
@@ -1060,6 +1062,22 @@ if ($Demo) {
 }
 
 # ══ 11. 主流程 ═══════════════════════════════════════════════
+
+# 单实例保护。没有这道锁的话，改了脚本再双击一次快捷方式，你以为在「重启」，
+# 其实是又开了一个实例，而全局热键还攥在旧进程手里——于是按热键走的永远是旧代码，
+# 改多少遍都「没生效」。踩过一次，代价是三小时查一个已经修好的 bug。
+# 放在这里而不是脚本开头：上面那些 -SelfTest / -OcrBench 调试模式必须能随时跑，
+# 不能因为托盘程序开着就被挡掉。
+$script:AppMutex = New-Object System.Threading.Mutex($false, 'ScreenTranslator.SingleInstance')
+if (-not $script:AppMutex.WaitOne(0, $false)) {
+    [void][System.Windows.Forms.MessageBox]::Show(
+        "屏幕翻译已经在运行了。`n`n" +
+        "旧的那个还攥着 $HotkeyName 热键，直接再打开一个并不会用上新改的脚本。`n" +
+        "请先在右下角托盘图标上右键 →「退出」，确认图标消失后再启动。",
+        '屏幕翻译', 'OK', 'Information')
+    exit 0
+}
+
 $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
 
 # -WindowStyle Hidden 启动时 STARTUPINFO 里是 SW_HIDE，Windows 会强制隐藏
